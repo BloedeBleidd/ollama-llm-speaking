@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    command: ["ollama", "run", "mistral-nemo:12b-instruct-2407-q5_K_M"]
+    restart: unless-stopped
+
+  speech_service:
+    build:
+      context: .
+    container_name: speech_service
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    depends_on:
+      - ollama
+    volumes:
+      - /dev/snd:/dev/snd
+    command: ["python3", "speech_service.py"]
+    restart: unless-stopped
+
+volumes:
+  ollama:
