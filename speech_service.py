@@ -1,19 +1,22 @@
-from time import sleep
 from threading import Thread, Event
-import numpy as np
-from sounddevice import RawInputStream, play, wait
 from queue import Queue
+from scipy.io.wavfile import write
 from rich.console import Console
 from transformers import AutoProcessor, BarkModel
-import whisper
-import torch
-import nltk
-import ollama
 from tqdm import tqdm
-import scipy.io.wavfile as wav
+import numpy as np
+import sounddevice as sd
+from whisper import load_model
+import torch
+import re
+import ollama
+from pathlib import Path
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 console = Console()
-stt = whisper.load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")
 
 class TextToSpeechService:
     def __init__(self, device: str = "cuda" if torch.cuda.is_available() else "cpu"):
@@ -31,49 +34,61 @@ class TextToSpeechService:
         sample_rate = self.model.generation_config.sample_rate
         return sample_rate, audio_array
 
-    def long_form_synthesize(self, text: str, voice_preset: str = "v2/en_speaker_1"):
-        pieces = []
-        sentences = nltk.sent_tokenize(text)
-        silence = np.zeros(int(0.25 * self.model.generation_config.sample_rate))
-        for sent in sentences:
-            sample_rate, audio_array = self.synthesize(sent, voice_preset)
-            pieces += [audio_array, silence.copy()]
-        return self.model.generation_config.sample_rate, np.concatenate(pieces)
+def truncate_text(text: str) -> list:
+    return re.split(r'(?<=[.!?:;\-]) +', text)
 
-tts = TextToSpeechService()
+def audio_synthesis_thread(text_queue: Queue, audio_queue: Queue, tts: TextToSpeechService, stop_event: Event):
+    while not stop_event.is_set():
+        try:
+            text_piece = text_queue.get(timeout=0.05)
+            sample_rate, audio_array = tts.synthesize(text_piece, "v2/en_speaker_9")
+            audio_queue.put((sample_rate, audio_array))
+        except Exception:
+            continue
 
-def record_audio(stop_event, data_queue):
+def audio_playback_thread(audio_queue: Queue, stop_event: Event):
+    while not stop_event.is_set():
+        try:
+            sample_rate, audio_array = audio_queue.get(timeout=0.01)
+            sd.play(audio_array, sample_rate)
+            sd.wait()
+        except Exception:
+            continue
+
+def record_audio(sample_rate, channels, audio_queue, stop_event):
+    console.print("[green]Recording...")
     def callback(indata, frames, time, status):
         if status:
             console.print(status)
-        data_queue.put(np.array(indata, dtype=np.int16))
-    with RawInputStream(samplerate=44100, dtype="int16", channels=1, callback=callback):
-        while not stop_event.is_set():
-            sleep(0.1)
+        audio_queue.put(indata.copy())
+    with sd.InputStream(samplerate=sample_rate, channels=channels, callback=callback):
+        stop_event.wait()
+    console.print("[green]Finished recording.")
 
-def save_audio_to_wav(audio_data, filename="output/user.wav", samplerate=44100):
-    wav.write(filename, samplerate, audio_data)
-    console.print(f"[green]Audio saved as '{filename}'")
+def transcribe_audio(filename: str) -> tuple:
+    model = load_model("base", device="cuda" if torch.cuda.is_available() else "cpu")
+    result = model.transcribe(filename)
+    return (result['text'], result['language'])
 
-def transcribe(filename: str) -> str:
-    result = stt.transcribe(filename, fp16=False)
-    text = result["text"].strip()
-    return text
-
-def get_llm_response(conversation: list, model_name: str) -> str:
+def stream_llm_response(conversation: list, model_name: str, text_queue: Queue):
     messages = [{"role": "user", "content": msg} for msg in conversation]
-    response = ollama.chat(model=model_name, messages=messages)
-    return response['message']['content']
+    response = ollama.chat(model=model_name, messages=messages, stream=True)
+    buffer = ""
+    for partial_response in response:
+        if "message" in partial_response and "content" in partial_response["message"]:
+            content = partial_response["message"]["content"]
+            console.print(content, end="")
+            buffer += content
+            sentences = truncate_text(buffer)
+            for sentence in sentences[:-1]:
+                text_queue.put(sentence)
+            buffer = sentences[-1]
+    if buffer.strip():
+        text_queue.put(buffer.strip())
+    console.print()
 
-def play_audio(sample_rate, audio_array):
-    play(audio_array, sample_rate)
-    wait()
-
-if __name__ == "__main__":
-    console.print("[cyan]Assistant started! Press Ctrl+C to exit.")
-    model_name = console.input("[blue]Enter the model name to download (e.g., 'mistral-nemo:12b-instruct-2407-q2_K'): ")
+def ollama_pull(model_name: str):
     console.print(f"[blue]Downloading model '{model_name}'...")
-
     current_digest, bars = '', {}
     for progress in ollama.pull(model_name, stream=True):
         digest = progress.get('digest', '')
@@ -87,51 +102,56 @@ if __name__ == "__main__":
         if completed := progress.get('completed'):
             bars[digest].update(completed - bars[digest].n)
         current_digest = digest
-
     console.print(f"[green]Model '{model_name}' downloaded!")
-    conversation = []  # To hold the context of the conversation
 
-    while True:
-        try:
-            console.print("[blue]Press Enter to start recording, and Enter again to stop...")
-            input("Press Enter to start recording...")
-
-            data_queue = Queue()
-            stop_event = Event()
-            recording_thread = Thread(target=record_audio, args=(stop_event, data_queue))
+if __name__ == "__main__":
+    tts = TextToSpeechService()
+    if not torch.cuda.is_available():
+        console.print("[yellow]CUDA is not available. Running on CPU.")
+    else:
+        console.print("[yellow]CUDA is available. Running on GPU.")
+    sample_rate = 22050
+    channels = 1
+    filename = "output/user.wav"
+    Path("output").mkdir(parents=True, exist_ok=True)
+    console.print("[cyan]Assistant started! Press Ctrl+C to exit.")
+    model_name = console.input("[blue]Enter the model name to download (e.g., 'mistral-nemo:12b-instruct-2407-q2_K'): ")
+    ollama_pull(model_name)
+    conversation = []
+    text_queue = Queue()
+    audio_queue = Queue()
+    stop_event = Event()
+    synth_thread = Thread(target=audio_synthesis_thread, args=(text_queue, audio_queue, tts, stop_event))
+    play_thread = Thread(target=audio_playback_thread, args=(audio_queue, stop_event))
+    synth_thread.start()
+    play_thread.start()
+    try:
+        while True:
+            console.input("[blue]Press Enter to start recording...")
+            audio_queue = Queue()
+            recording_thread = Thread(target=record_audio, args=(sample_rate, channels, audio_queue, stop_event))
             recording_thread.start()
-
-            input("Press Enter to stop recording...")
+            console.input("[blue]Press Enter to stop recording...")
             stop_event.set()
             recording_thread.join()
-
             console.print("[green]Processing audio...")
-
-            audio_data = np.concatenate(list(data_queue.queue), axis=0)
-            audio_data = np.asarray(audio_data, dtype=np.int16)
-
-            # Save the audio to a WAV file
-            save_audio_to_wav(audio_data)
-
-            if audio_data.size > 0:
-                with console.status("Transcribing...", spinner="earth"):
-                    text = transcribe("output/user.wav")
-                console.print(f"[yellow]You: {text}")
-
-                conversation.append(text)
-
-                with console.status("Generating response...", spinner="earth"):
-                    response = get_llm_response(conversation, model_name)
-                    conversation.append(response)
-                    sample_rate, audio_array = tts.long_form_synthesize(response)
-
-                console.print(f"[cyan]Assistant: {response}")
-                play_audio(sample_rate, audio_array)
-            else:
+            frames = [audio_queue.get() for _ in range(audio_queue.qsize())]
+            if not frames:
                 console.print("[red]No audio recorded. Please ensure your microphone is working.")
-
-        except KeyboardInterrupt:
-            console.print("\n[red]Exiting...")
-            break
-
+                continue
+            audio_data = np.concatenate(frames, axis=0)
+            write(filename, sample_rate, audio_data)
+            console.print(f"[green]Transcribing...")
+            text, language = transcribe_audio(filename)
+            console.print(f"[yellow]You said: {text}")
+            conversation.append(text)
+            console.print("[green]Assistant response:")
+            stream_llm_response(conversation, model_name, text_queue)
+    except KeyboardInterrupt:
+        console.print("\n[red]Exiting...")
+        stop_event.set()
+        synth_thread.join()
+        play_thread.join()
+    except Exception as e:
+        console.print(f"[red]An error occurred: {e}")
     console.print("[blue]Session ended.")

@@ -2,7 +2,6 @@ FROM python:3.12-slim
 
 # Set up environment
 ENV DEBIAN_FRONTEND=noninteractive
-ENV NLTK_DATA=/usr/local/share/nltk_data
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -22,14 +21,10 @@ RUN pip install --upgrade pip &&\
     rich==13.7.1 \
     torch==2.4.0 \
     transformers==4.44.0 \
-    nltk==3.8.1 \
     tqdm==4.66.5 \
     ollama==0.3.1 \
     openai-whisper==20230306 \
     bark==0.1.5
-
-# Download NLTK data
-RUN python -m nltk.downloader -d /usr/local/share/nltk_data punkt
 
 # Preload the Whisper model and other transformers models during build
 RUN python -c "import whisper; whisper.load_model('base')"
